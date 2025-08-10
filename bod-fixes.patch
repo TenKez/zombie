@@ -1,0 +1,393 @@
+diff --git a/Assets/Scripts/World/NoiseSystem.cs b/Assets/Scripts/World/NoiseSystem.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/World/NoiseSystem.cs
++++ b/Assets/Scripts/World/NoiseSystem.cs
+@@ -1,999 +1,67 @@
+-using UnityEngine;
+-using Unity.Netcode;
+-using System.Collections.Generic;
+-
+-public struct NoiseEvent : INetworkSerializable
+-{
+-    public Vector3 Position;
+-    public float Strength;
+-
+-    public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
+-    {
+-        serializer.SerializeValue(ref Position);
+-        serializer.SerializeValue(ref Strength);
+-    }
+-}
+-
+-public class NoiseSystem : NetworkBehaviour
+-{
+-    public static NoiseSystem Instance;
+-
+-    private NetworkList<NoiseEvent> _events;
+-
+-    private void Awake()
+-    {
+-        Instance = this;
+-        _events = new NetworkList<NoiseEvent>();
+-    }
+-
+-    public override void OnNetworkSpawn()
+-    {
+-        if (!IsServer) enabled = false; // server-authoritative
+-    }
+-
+-    public static void Emit(Vector3 pos, float strength, ulong owner)
+-    {
+-        if (Instance == null || !Instance.IsServer) return;
+-        Instance._events.Add(new NoiseEvent { Position = pos, Strength = strength });
+-    }
+-
+-    public IEnumerable<NoiseEvent> Drain()
+-    {
+-        // Simple drain: copy and clear
+-        var list = new List<NoiseEvent>(_events);
+-        _events.Clear();
+-        return list;
+-    }
+-}
++using UnityEngine;
++using Unity.Netcode;
++using System.Collections.Generic;
++
++public struct NoiseEvent
++{
++    public Vector3 Position;
++    public float Strength;
++}
++
++public class NoiseSystem : NetworkBehaviour
++{
++    public static NoiseSystem Instance;
++
++    private readonly List<NoiseEvent> _events = new List<NoiseEvent>();
++    private readonly List<NoiseEvent> _snapshot = new List<NoiseEvent>();
++
++    private void Awake()
++    {
++        Instance = this;
++    }
++
++    public override void OnNetworkSpawn()
++    {
++        if (!IsServer) enabled = false; // server-authoritative
++    }
++
++    public static void Emit(Vector3 pos, float strength)
++    {
++        if (Instance == null || !Instance.IsServer) return;
++        Instance._events.Add(new NoiseEvent { Position = pos, Strength = strength });
++    }
++
++    // Zombies read all noises produced this frame (non-destructive).
++    public IReadOnlyList<NoiseEvent> GetSnapshot()
++    {
++        _snapshot.Clear();
++        _snapshot.AddRange(_events);
++        return _snapshot;
++    }
++
++    // Clear once per frame after AIs have read it.
++    private void LateUpdate()
++    {
++        if (!IsServer) return;
++        _events.Clear();
++    }
++}
+diff --git a/Assets/Scripts/Zombie/ZombieAI.cs b/Assets/Scripts/Zombie/ZombieAI.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Zombie/ZombieAI.cs
++++ b/Assets/Scripts/Zombie/ZombieAI.cs
+@@ -1,6 +1,6 @@
+-        // Noise reactions
+-        foreach (var ev in NoiseSystem.Instance?.Drain() ?? System.Array.Empty<NoiseEvent>())
++        // Noise reactions
++        foreach (var ev in NoiseSystem.Instance?.GetSnapshot() ?? System.Array.Empty<NoiseEvent>())
+         {
+             float dist = Vector3.Distance(transform.position, ev.Position);
+             if (dist < hearingRange * Mathf.Lerp(0.5f, 1.5f, ev.Strength))
+             {
+                 _state = State.Investigate;
+diff --git a/Assets/Scripts/Inventory/Item.cs b/Assets/Scripts/Inventory/Item.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Inventory/Item.cs
++++ b/Assets/Scripts/Inventory/Item.cs
+@@ -1,200 +1,210 @@
+-using System;
+-using UnityEngine;
+-using Unity.Netcode;
++using System;
++using UnityEngine;
++using Unity.Netcode;
++using Unity.Collections; // FixedString64Bytes
+@@
+ public class Item : ScriptableObject
+ {
+     public string Id;
+     public string DisplayName;
+     public ItemType Type;
+     public Sprite Icon;
+     public GameObject WorldPrefab;
+@@
+ }
+ 
+-[Serializable]
+-public struct ItemStack : INetworkSerializable, IEquatable<ItemStack>
+-{
+-    public string ItemId;
+-    public int Count;
+-
+-    public ItemStack(string id, int count)
+-    {
+-        ItemId = id;
+-        Count = count;
+-    }
+-
+-    public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
+-    {
+-        serializer.SerializeValue(ref ItemId);
+-        serializer.SerializeValue(ref Count);
+-    }
+-
+-    public bool Equals(ItemStack other) => ItemId == other.ItemId && Count == other.Count;
+-    public override string ToString() => $"{ItemId} x{Count}";
+-}
++[Serializable]
++public struct ItemStack : INetworkSerializable, IEquatable<ItemStack>
++{
++    public FixedString64Bytes ItemId;
++    public int Count;
++
++    public ItemStack(string id, int count)
++    {
++        ItemId = new FixedString64Bytes(id ?? "");
++        Count = count;
++    }
++
++    public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReaderWriter
++    {
++        serializer.SerializeValue(ref ItemId);
++        serializer.SerializeValue(ref Count);
++    }
++
++    public bool Equals(ItemStack other) => ItemId.Equals(other.ItemId) && Count == other.Count;
++    public override bool Equals(object obj) => obj is ItemStack other && Equals(other);
++    public override int GetHashCode()
++    {
++        unchecked
++        {
++            int hash = ItemId.GetHashCode();
++            hash = (hash * 397) ^ Count.GetHashCode();
++            return hash;
++        }
++    }
++    public override string ToString() => $"{ItemId} x{Count}";
++}
+diff --git a/Assets/Scripts/Inventory/Inventory.cs b/Assets/Scripts/Inventory/Inventory.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Inventory/Inventory.cs
++++ b/Assets/Scripts/Inventory/Inventory.cs
+@@ -1,120 +1,126 @@
+-using System;
+-using System.Collections.Generic;
+-using UnityEngine;
+-using Unity.Netcode;
++using System;
++using UnityEngine;
++using Unity.Netcode;
++using Unity.Collections;
+@@
+ public class Inventory : NetworkBehaviour
+ {
+     [SerializeField] private int slots = 24;
+     [SerializeField] private ItemDatabase database;
+ 
+     public NetworkList<ItemStack> Items;
+ 
+     public event Action OnInventoryChanged;
+ 
+     private void Awake()
+     {
+         Items = new NetworkList<ItemStack>();
+     }
+ 
+     public override void OnNetworkSpawn()
+     {
+         if (IsServer)
+         {
+             for (int i = 0; i < slots; i++) Items.Add(new ItemStack("", 0));
+         }
+ 
+         Items.OnListChanged += _ => OnInventoryChanged?.Invoke();
+     }
+ 
+     [ServerRpc(RequireOwnership = false)]
+     public void AddItemServerRpc(string itemId, int count)
+     {
+-        for (int i = 0; i < Items.Count; i++)
++        var id = new FixedString64Bytes(itemId ?? "");
++        for (int i = 0; i < Items.Count; i++)
+         {
+             var st = Items[i];
+-            if (string.IsNullOrEmpty(st.ItemId))
++            if (st.ItemId.Length == 0)
+             {
+                 Items[i] = new ItemStack(itemId, count);
+                 return;
+             }
+-            if (st.ItemId == itemId)
++            if (st.ItemId.Equals(id))
+             {
+                 st.Count += count;
+                 Items[i] = st;
+                 return;
+             }
+         }
+     }
+ 
+     [ServerRpc(RequireOwnership = false)]
+     public void RemoveItemServerRpc(string itemId, int count)
+     {
+-        for (int i = 0; i < Items.Count; i++)
++        var id = new FixedString64Bytes(itemId ?? "");
++        for (int i = 0; i < Items.Count; i++)
+         {
+             var st = Items[i];
+-            if (st.ItemId == itemId)
++            if (st.ItemId.Equals(id))
+             {
+                 st.Count -= count;
+                 if (st.Count <= 0) st = new ItemStack("", 0);
+                 Items[i] = st;
+                 return;
+             }
+         }
+     }
+ 
+     public bool HasItem(string id, int count)
+     {
+-        int total = 0;
+-        foreach (var st in Items)
+-            if (st.ItemId == id) total += st.Count;
+-        return total >= count;
++        var fid = new FixedString64Bytes(id ?? "");
++        int total = 0;
++        foreach (var st in Items)
++            if (st.ItemId.Equals(fid)) total += st.Count;
++        return total >= count;
+     }
+ }
+diff --git a/Assets/Scripts/Claiming/ClaimArea.cs b/Assets/Scripts/Claiming/ClaimArea.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Claiming/ClaimArea.cs
++++ b/Assets/Scripts/Claiming/ClaimArea.cs
+@@ -1,20 +1,20 @@
+ using UnityEngine;
+ using Unity.Netcode;
+ 
+ public class ClaimArea : NetworkBehaviour
+ {
+     public NetworkVariable<Vector3> CornerA = new NetworkVariable<Vector3>();
+     public NetworkVariable<Vector3> CornerB = new NetworkVariable<Vector3>();
+-    public NetworkVariable<ulong> OwnerClientId = new NetworkVariable<ulong>(0);
++    public NetworkVariable<ulong> ClaimOwnerClientId = new NetworkVariable<ulong>(0);
+ 
+     public bool Contains(Vector3 pos)
+     {
+         var min = Vector3.Min(CornerA.Value, CornerB.Value);
+         var max = Vector3.Max(CornerA.Value, CornerB.Value);
+         return pos.x >= min.x && pos.x <= max.x && pos.z >= min.z && pos.z <= max.z;
+     }
+ 
+-    public bool CanBuild(ulong clientId, Vector3 at) => OwnerClientId.Value == clientId && Contains(at);
++    public bool CanBuild(ulong clientId, Vector3 at) => ClaimOwnerClientId.Value == clientId && Contains(at);
+ }
+diff --git a/Assets/Scripts/Claiming/ClaimMainChest.cs b/Assets/Scripts/Claiming/ClaimMainChest.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Claiming/ClaimMainChest.cs
++++ b/Assets/Scripts/Claiming/ClaimMainChest.cs
+@@ -1,33 +1,33 @@
+ using UnityEngine;
+ using Unity.Netcode;
+ 
+ public class ClaimMainChest : NetworkBehaviour
+ {
+     public ClaimArea area;
+     public StorageContainer chestStorage;
+     public string zombieBloodItemId = "ZombieBlood";
+     public int requiredBlood = 1;
+ 
+     public override void OnNetworkSpawn()
+     {
+         if (area == null) area = GetComponentInParent<ClaimArea>();
+         if (chestStorage == null) chestStorage = GetComponent<StorageContainer>();
+     }
+ 
+     public bool HasBlood()
+     {
+         if (chestStorage?.Inventory == null) return false;
+         int total = 0;
+         foreach (var st in chestStorage.Inventory.Items)
+-            if (st.ItemId == zombieBloodItemId) total += st.Count;
++            if (st.ItemId.Equals(zombieBloodItemId)) total += st.Count;
+         return total >= requiredBlood;
+     }
+ }
+diff --git a/Assets/Scripts/Player/PlayerController.cs b/Assets/Scripts/Player/PlayerController.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Player/PlayerController.cs
++++ b/Assets/Scripts/Player/PlayerController.cs
+@@ -1,5 +1,5 @@
+-        if (input.sqrMagnitude > 0.2f)
+-        {
+-            NoiseSystem.Emit(transform.position, sprint ? 1.5f : 0.8f, owner: NetworkObjectId);
+-        }
++        if (input.sqrMagnitude > 0.2f)
++        {
++            NoiseSystem.Emit(transform.position, sprint ? 1.5f : 0.8f);
++        }
+diff --git a/Assets/Scripts/World/LootContainer.cs b/Assets/Scripts/World/LootContainer.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/World/LootContainer.cs
++++ b/Assets/Scripts/World/LootContainer.cs
+@@ -1,5 +1,5 @@
+-        NoiseSystem.Emit(transform.position, openNoise, owner: NetworkObjectId);
++        NoiseSystem.Emit(transform.position, openNoise);
+diff --git a/Assets/Scripts/World/DoorLock.cs b/Assets/Scripts/World/DoorLock.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/World/DoorLock.cs
++++ b/Assets/Scripts/World/DoorLock.cs
+@@ -1,6 +1,6 @@
+-            if (Random.value < 0.15f) // periodic hits make noise
+-                NoiseSystem.Emit(transform.position, noise, owner: NetworkObjectId);
++            if (Random.value < 0.15f) // periodic hits make noise
++                NoiseSystem.Emit(transform.position, noise);
+@@ -1,4 +1,4 @@
+-        NoiseSystem.Emit(transform.position, noise * 1.25f, owner: NetworkObjectId); // final bang
++        NoiseSystem.Emit(transform.position, noise * 1.25f); // final bang
+diff --git a/Assets/Scripts/Security/Alarm.cs b/Assets/Scripts/Security/Alarm.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Security/Alarm.cs
++++ b/Assets/Scripts/Security/Alarm.cs
+@@ -1,5 +1,5 @@
+-                NoiseSystem.Emit(transform.position, noiseStrength, owner: NetworkObjectId);
++                NoiseSystem.Emit(transform.position, noiseStrength);
+diff --git a/Assets/Scripts/Comms/VoiceChatInterface.cs b/Assets/Scripts/Comms/VoiceChatInterface.cs
+index 0000000..0000000 100644
+--- a/Assets/Scripts/Comms/VoiceChatInterface.cs
++++ b/Assets/Scripts/Comms/VoiceChatInterface.cs
+@@ -1,6 +1,6 @@
+-        if (speaking)
+-        {
+-            // TODO: Query input mic volume; for now, emit a fixed noise magnitude.
+-            NoiseSystem.Emit(transform.position, channel == VoiceChannel.Proximity ? 0.6f : 0.3f, owner: 0);
+-        }
++        if (speaking)
++        {
++            // TODO: Query input mic volume; for now, emit a fixed noise magnitude.
++            NoiseSystem.Emit(transform.position, channel == VoiceChannel.Proximity ? 0.6f : 0.3f);
++        }
